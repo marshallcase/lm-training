@@ -37,8 +37,8 @@
     "use_amp": true
   },
   "data": {
-    "train_file": "/home/marshall/lmodel/lmtraining/data/processed/train.txt",
-    "validation_file": "/home/marshall/lmodel/lmtraining/data/processed/valid.txt",
+    "train_file": "/home/marshall/lmodel/data/processed/train.txt",
+    "validation_file": "/home/marshall/lmodel/data/processed/valid.txt",
     "tokenizer_name": "gpt2",
     "max_seq_length": 1024,
     "preprocessing_num_workers": 4,
