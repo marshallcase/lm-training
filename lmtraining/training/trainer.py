@@ -43,6 +43,13 @@ class Trainer:
         # Set up device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
+
+        logger.info(f"Using device: {self.device}")
+        if self.device.type == 'cuda':
+            logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+            logger.info(f"GPU memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
+            param_device = next(self.model.parameters()).device
+            logger.info(f"Model parameters are on: {param_device}")
         
         # Set up automatic mixed precision if enabled
         self.use_amp = config.training.use_amp and torch.cuda.is_available()
