@@ -34,3 +34,6 @@ mlflow>=2.3.0
 # For handling different data formats
 jsonlines>=3.1.0
 pyyaml>=6.0
+
+#for training data
+datasets>=2.12.0

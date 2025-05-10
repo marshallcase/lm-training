@@ -28,6 +28,7 @@ setup(
         "jsonlines>=3.1.0",
         "pyyaml>=6.0",
         "mlflow>=2.3.0",
+        "datasets>=2.12.0", 
     ],
     extras_require={
         "dev": [
