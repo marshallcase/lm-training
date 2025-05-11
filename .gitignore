@@ -68,8 +68,11 @@ logs/
 tensorboard/
 
 # Data (you might want to customize this based on your needs)
-data/
-datasets/
-raw_data/
-processed_data/
-outputs/
+/data/
+/datasets/
+/raw_data/
+/processed_data/
+/outputs/
+
+# Make sure lmtraining/data/ module is not ignored
+!/lmtraining/data/
