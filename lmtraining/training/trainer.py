@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Any, Union, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from torch.cuda.amp import autocast, GradScaler
 
 from lmtraining.models.transformer import TransformerModel
@@ -91,7 +91,18 @@ class Trainer:
                 t_total = self.config.training.max_steps
             else:
                 # Calculate total steps based on epochs
-                t_total = len(self.train_dataloader) * self.config.training.num_train_epochs
+                # Check if dataset is IterableDataset - it has no __len__
+                if isinstance(self.train_dataloader.dataset, IterableDataset):
+                    # For streaming datasets, we estimate using a default size
+                    # This is just for the scheduler, so precision isn't critical
+                    logger.info("Using estimated dataset size for scheduler as dataloader uses IterableDataset")
+                    estimated_dataset_size = 100000  # A reasonable estimate for WikiText
+                    steps_per_epoch = estimated_dataset_size // self.config.training.train_batch_size
+                    t_total = steps_per_epoch * self.config.training.num_train_epochs
+                else:
+                    # For regular datasets, use the length
+                    t_total = len(self.train_dataloader) * self.config.training.num_train_epochs
+                
                 t_total = math.ceil(t_total / self.config.training.gradient_accumulation_steps)
             
             warmup_steps = self.config.training.warmup_steps
@@ -116,18 +127,35 @@ class Trainer:
         # Calculate total number of training steps
         if self.config.training.max_steps > 0:
             t_total = self.config.training.max_steps
-            num_train_epochs = math.ceil(
-                self.config.training.max_steps / len(self.train_dataloader) * 
-                self.config.training.gradient_accumulation_steps
-            )
+            
+            # For streaming datasets with no len() support
+            if isinstance(self.train_dataloader.dataset, IterableDataset):
+                num_train_epochs = None  # We'll just track steps, not epochs
+            else:
+                num_train_epochs = math.ceil(
+                    self.config.training.max_steps / len(self.train_dataloader) * 
+                    self.config.training.gradient_accumulation_steps
+                )
         else:
-            t_total = len(self.train_dataloader) * self.config.training.num_train_epochs
-            t_total = math.ceil(t_total / self.config.training.gradient_accumulation_steps)
+            # For streaming datasets with no len() support
+            if isinstance(self.train_dataloader.dataset, IterableDataset):
+                logger.info("Using streaming dataset - will train for the specified number of epochs")
+                # We'll define a step limit per epoch to avoid infinite iterations
+                steps_per_epoch = 5000  # A reasonable default for one epoch through WikiText
+                t_total = steps_per_epoch * self.config.training.num_train_epochs
+            else:
+                t_total = len(self.train_dataloader) * self.config.training.num_train_epochs
+                t_total = math.ceil(t_total / self.config.training.gradient_accumulation_steps)
+                
             num_train_epochs = self.config.training.num_train_epochs
         
         logger.info(f"***** Running training *****")
-        logger.info(f"  Num examples = {len(self.train_dataloader.dataset)}")
-        logger.info(f"  Num Epochs = {num_train_epochs}")
+        if isinstance(self.train_dataloader.dataset, IterableDataset):
+            logger.info(f"  Using streaming dataset (no fixed size)")
+        else:
+            logger.info(f"  Num examples = {len(self.train_dataloader.dataset)}")
+            
+        logger.info(f"  Num Epochs = {num_train_epochs if num_train_epochs else 'tracking by steps'}")
         logger.info(f"  Total train batch size = {self.config.training.train_batch_size}")
         logger.info(f"  Gradient Accumulation steps = {self.config.training.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {t_total}")
@@ -144,96 +172,206 @@ class Trainer:
         self.model.train()
         self.optimizer.zero_grad()
         
-        train_iterator = range(int(num_train_epochs))
+        train_iterator = range(int(num_train_epochs)) if num_train_epochs else range(1000)  # Large range for step-based stopping
         
         for _ in train_iterator:
             self.epoch = epochs_trained + _ + 1
-            epoch_iterator = tqdm(self.train_dataloader, desc=f"Epoch {self.epoch}")
             
-            for step, batch in enumerate(epoch_iterator):
-                # Skip steps if resuming from checkpoint
-                if steps_trained_in_current_epoch > 0:
-                    steps_trained_in_current_epoch -= 1
-                    continue
+            # For streaming datasets, we need to handle epoch differently
+            if isinstance(self.train_dataloader.dataset, IterableDataset):
+                logger.info(f"Starting epoch {self.epoch} (streaming dataset)")
+                steps_in_epoch = 0
+                max_steps_in_epoch = 5000 if self.config.training.max_steps <= 0 else t_total // len(train_iterator)
                 
-                # Move batch to device
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                # Use tqdm with an estimated range
+                epoch_iterator = tqdm(self.train_dataloader, desc=f"Epoch {self.epoch}", total=max_steps_in_epoch)
                 
-                # Forward pass with or without mixed precision
-                if self.use_amp:
-                    with autocast():
+                # We'll break manually after max_steps_in_epoch for streaming datasets
+                epoch_done = False
+                
+                for batch in epoch_iterator:
+                    # Skip steps if resuming from checkpoint
+                    if steps_trained_in_current_epoch > 0:
+                        steps_trained_in_current_epoch -= 1
+                        continue
+                    
+                    # Move batch to device
+                    batch = {k: v.to(self.device) for k, v in batch.items()}
+                    
+                    # Forward pass with or without mixed precision
+                    if self.use_amp:
+                        with autocast():
+                            outputs = self.model(**batch)
+                            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                            loss = loss / self.config.training.gradient_accumulation_steps
+                        
+                        # Backward pass with scaler
+                        self.scaler.scale(loss).backward()
+                    else:
                         outputs = self.model(**batch)
                         loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
                         loss = loss / self.config.training.gradient_accumulation_steps
+                        loss.backward()
                     
-                    # Backward pass with scaler
-                    self.scaler.scale(loss).backward()
-                else:
-                    outputs = self.model(**batch)
-                    loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-                    loss = loss / self.config.training.gradient_accumulation_steps
-                    loss.backward()
-                
-                tr_loss += loss.item()
-                
-                # Update weights if gradient accumulation is complete
-                if (step + 1) % self.config.training.gradient_accumulation_steps == 0:
-                    if self.use_amp:
-                        # Unscale gradients and clip
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.config.training.max_grad_norm
-                        )
+                    tr_loss += loss.item()
+                    
+                    # Update weights if gradient accumulation is complete
+                    if (steps_in_epoch + 1) % self.config.training.gradient_accumulation_steps == 0:
+                        if self.use_amp:
+                            # Unscale gradients and clip
+                            self.scaler.unscale_(self.optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), self.config.training.max_grad_norm
+                            )
+                            
+                            # Update weights with scaler
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                        else:
+                            # Clip gradients
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), self.config.training.max_grad_norm
+                            )
+                            
+                            # Update weights
+                            self.optimizer.step()
                         
-                        # Update weights with scaler
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                    else:
-                        # Clip gradients
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.config.training.max_grad_norm
-                        )
+                        # Update learning rate
+                        if self.lr_scheduler is not None:
+                            self.lr_scheduler.step()
                         
-                        # Update weights
-                        self.optimizer.step()
+                        # Reset gradients
+                        self.optimizer.zero_grad()
+                        
+                        # Update global step
+                        self.global_step += 1
+                        
+                        # Update progress bar
+                        epoch_iterator.set_postfix(loss=tr_loss / self.global_step)
+                        
+                        # Log progress
+                        if self.global_step % self.config.training.logging_steps == 0:
+                            logs = {
+                                "loss": tr_loss / self.global_step,
+                                "learning_rate": self.get_lr(),
+                                "epoch": self.epoch,
+                                "step": self.global_step,
+                            }
+                            logger.info(f"Training: {logs}")
+                        
+                        # Evaluate if needed
+                        if (self.config.training.evaluation_strategy == "steps" and 
+                            self.global_step % self.config.training.eval_steps == 0):
+                            self.evaluate()
+                            self.model.train()
+                        
+                        # Save checkpoint
+                        if self.global_step % self.config.training.save_steps == 0:
+                            self.save_model()
                     
-                    # Update learning rate
-                    if self.lr_scheduler is not None:
-                        self.lr_scheduler.step()
+                    # Increment step counter
+                    steps_in_epoch += 1
                     
-                    # Reset gradients
-                    self.optimizer.zero_grad()
+                    # Break if max steps reached
+                    if self.config.training.max_steps > 0 and self.global_step >= self.config.training.max_steps:
+                        epoch_done = True
+                        break
                     
-                    # Update global step
-                    self.global_step += 1
-                    
-                    # Update progress bar
-                    epoch_iterator.set_postfix(loss=tr_loss / self.global_step)
-                    
-                    # Log progress
-                    if self.global_step % self.config.training.logging_steps == 0:
-                        logs = {
-                            "loss": tr_loss / self.global_step,
-                            "learning_rate": self.get_lr(),
-                            "epoch": self.epoch,
-                            "step": self.global_step,
-                        }
-                        logger.info(f"Training: {logs}")
-                    
-                    # Evaluate if needed
-                    if (self.config.training.evaluation_strategy == "steps" and 
-                        self.global_step % self.config.training.eval_steps == 0):
-                        self.evaluate()
-                        self.model.train()
-                    
-                    # Save checkpoint
-                    if self.global_step % self.config.training.save_steps == 0:
-                        self.save_model()
+                    # Break if we've done enough steps for this epoch
+                    if steps_in_epoch >= max_steps_in_epoch:
+                        break
                 
-                # Break if max steps reached
-                if self.config.training.max_steps > 0 and self.global_step >= self.config.training.max_steps:
-                    epoch_iterator.close()
+                # Skip regular epoch handling if we're done
+                if epoch_done:
                     break
+            else:
+                # Regular dataset with __len__ support
+                epoch_iterator = tqdm(self.train_dataloader, desc=f"Epoch {self.epoch}")
+                
+                for step, batch in enumerate(epoch_iterator):
+                    # Skip steps if resuming from checkpoint
+                    if steps_trained_in_current_epoch > 0:
+                        steps_trained_in_current_epoch -= 1
+                        continue
+                    
+                    # Move batch to device
+                    batch = {k: v.to(self.device) for k, v in batch.items()}
+                    
+                    # Forward pass with or without mixed precision
+                    if self.use_amp:
+                        with autocast():
+                            outputs = self.model(**batch)
+                            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                            loss = loss / self.config.training.gradient_accumulation_steps
+                        
+                        # Backward pass with scaler
+                        self.scaler.scale(loss).backward()
+                    else:
+                        outputs = self.model(**batch)
+                        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                        loss = loss / self.config.training.gradient_accumulation_steps
+                        loss.backward()
+                    
+                    tr_loss += loss.item()
+                    
+                    # Update weights if gradient accumulation is complete
+                    if (step + 1) % self.config.training.gradient_accumulation_steps == 0:
+                        if self.use_amp:
+                            # Unscale gradients and clip
+                            self.scaler.unscale_(self.optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), self.config.training.max_grad_norm
+                            )
+                            
+                            # Update weights with scaler
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                        else:
+                            # Clip gradients
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), self.config.training.max_grad_norm
+                            )
+                            
+                            # Update weights
+                            self.optimizer.step()
+                        
+                        # Update learning rate
+                        if self.lr_scheduler is not None:
+                            self.lr_scheduler.step()
+                        
+                        # Reset gradients
+                        self.optimizer.zero_grad()
+                        
+                        # Update global step
+                        self.global_step += 1
+                        
+                        # Update progress bar
+                        epoch_iterator.set_postfix(loss=tr_loss / self.global_step)
+                        
+                        # Log progress
+                        if self.global_step % self.config.training.logging_steps == 0:
+                            logs = {
+                                "loss": tr_loss / self.global_step,
+                                "learning_rate": self.get_lr(),
+                                "epoch": self.epoch,
+                                "step": self.global_step,
+                            }
+                            logger.info(f"Training: {logs}")
+                        
+                        # Evaluate if needed
+                        if (self.config.training.evaluation_strategy == "steps" and 
+                            self.global_step % self.config.training.eval_steps == 0):
+                            self.evaluate()
+                            self.model.train()
+                        
+                        # Save checkpoint
+                        if self.global_step % self.config.training.save_steps == 0:
+                            self.save_model()
+                    
+                    # Break if max steps reached
+                    if self.config.training.max_steps > 0 and self.global_step >= self.config.training.max_steps:
+                        epoch_iterator.close()
+                        break
             
             # Evaluate at end of epoch if configured
             if self.config.training.evaluation_strategy == "epoch":
@@ -256,7 +394,14 @@ class Trainer:
             return None
         
         logger.info(f"***** Running evaluation *****")
-        logger.info(f"  Num examples = {len(self.eval_dataloader.dataset)}")
+        if isinstance(self.eval_dataloader.dataset, IterableDataset):
+            logger.info(f"  Using streaming dataset for evaluation")
+            # Set a reasonable maximum number of steps for evaluation
+            max_eval_steps = 500  # Limit evaluation on streaming datasets
+        else:
+            logger.info(f"  Num examples = {len(self.eval_dataloader.dataset)}")
+            max_eval_steps = None
+        
         logger.info(f"  Batch size = {self.config.training.eval_batch_size}")
         
         # Set model to evaluation mode
@@ -265,7 +410,8 @@ class Trainer:
         eval_loss = 0.0
         eval_steps = 0
         
-        for batch in tqdm(self.eval_dataloader, desc="Evaluating"):
+        eval_iterator = tqdm(self.eval_dataloader, desc="Evaluating")
+        for batch in eval_iterator:
             # Move batch to device
             batch = {k: v.to(self.device) for k, v in batch.items()}
             
@@ -275,7 +421,15 @@ class Trainer:
                 eval_loss += loss.mean().item()
             
             eval_steps += 1
+            
+            # Limit evaluation steps for streaming datasets
+            if max_eval_steps is not None and eval_steps >= max_eval_steps:
+                break
         
+        if eval_steps == 0:
+            logger.warning("No evaluation steps performed! Check your eval dataset.")
+            return None
+            
         eval_loss = eval_loss / eval_steps
         perplexity = math.exp(eval_loss)
         
