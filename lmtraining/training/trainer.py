@@ -4,8 +4,10 @@ import time
 import math
 import json
 import logging
+import csv
 from tqdm import tqdm
 from typing import Dict, List, Optional, Any, Union, Tuple
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -62,6 +64,25 @@ class Trainer:
         
         # Create output directory if it doesn't exist
         os.makedirs(config.training.output_dir, exist_ok=True)
+        
+        # Setup training metrics tracking
+        self.metrics_file = os.path.join(config.training.output_dir, "training_metrics.csv")
+        self.training_metrics = []
+        self.setup_metrics_file()
+        
+        # Save initial configuration
+        self.save_config()
+        
+    def setup_metrics_file(self):
+        """Create metrics file with header row if it doesn't exist."""
+        if not os.path.exists(self.metrics_file):
+            with open(self.metrics_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'timestamp', 'epoch', 'step', 'learning_rate', 'train_loss', 
+                    'eval_loss', 'eval_perplexity', 'memory_used_mb'
+                ])
+            logger.info(f"Created metrics file at {self.metrics_file}")
         
     def _create_optimizer(self):
         no_decay = ["bias", "LayerNorm.weight"]
@@ -122,6 +143,50 @@ class Trainer:
         
         return None
     
+    def log_metrics(self, metrics):
+        """Log metrics to CSV file."""
+        # Add timestamp and memory usage to metrics
+        metrics['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        if torch.cuda.is_available():
+            metrics['memory_used_mb'] = torch.cuda.memory_allocated(0) / (1024 * 1024)
+        else:
+            metrics['memory_used_mb'] = 0
+            
+        # Store in memory
+        self.training_metrics.append(metrics)
+        
+        # Write to CSV
+        with open(self.metrics_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            row = [
+                metrics.get('timestamp', ''),
+                metrics.get('epoch', ''),
+                metrics.get('step', ''),
+                metrics.get('learning_rate', ''),
+                metrics.get('train_loss', ''),
+                metrics.get('eval_loss', ''),
+                metrics.get('eval_perplexity', ''),
+                metrics.get('memory_used_mb', '')
+            ]
+            writer.writerow(row)
+            
+        # Also save as JSON for easy parsing
+        json_file = os.path.join(os.path.dirname(self.metrics_file), "training_metrics.json")
+        with open(json_file, 'w') as f:
+            json.dump(self.training_metrics, f, indent=2)
+    
+    def save_config(self):
+        """Save full config as JSON for reference."""
+        config_path = os.path.join(self.config.training.output_dir, "full_config.json")
+        config_dict = {
+            "model": {k: getattr(self.config.model, k) for k in self.config.model.__dataclass_fields__},
+            "training": {k: getattr(self.config.training, k) for k in self.config.training.__dataclass_fields__},
+            "data": {k: getattr(self.config.data, k) for k in self.config.data.__dataclass_fields__},
+        }
+        with open(config_path, 'w') as f:
+            json.dump(config_dict, f, indent=2)
+        logger.info(f"Full configuration saved to {config_path}")
+    
     def train(self):
         """Main training loop."""
         # Calculate total number of training steps
@@ -171,6 +236,14 @@ class Trainer:
         # Set model to training mode
         self.model.train()
         self.optimizer.zero_grad()
+        
+        # Log initial metrics
+        self.log_metrics({
+            'epoch': 0, 
+            'step': 0,
+            'learning_rate': self.get_lr(),
+            'train_loss': 0.0,
+        })
         
         train_iterator = range(int(num_train_epochs)) if num_train_epochs else range(1000)  # Large range for step-based stopping
         
@@ -252,17 +325,27 @@ class Trainer:
                         # Log progress
                         if self.global_step % self.config.training.logging_steps == 0:
                             logs = {
-                                "loss": tr_loss / self.global_step,
-                                "learning_rate": self.get_lr(),
                                 "epoch": self.epoch,
                                 "step": self.global_step,
+                                "learning_rate": self.get_lr(),
+                                "train_loss": tr_loss / self.global_step,
                             }
                             logger.info(f"Training: {logs}")
+                            self.log_metrics(logs)
                         
                         # Evaluate if needed
                         if (self.config.training.evaluation_strategy == "steps" and 
                             self.global_step % self.config.training.eval_steps == 0):
-                            self.evaluate()
+                            eval_results = self.evaluate()
+                            if eval_results:
+                                self.log_metrics({
+                                    'epoch': self.epoch,
+                                    'step': self.global_step,
+                                    'learning_rate': self.get_lr(),
+                                    'train_loss': tr_loss / self.global_step,
+                                    'eval_loss': eval_results['loss'],
+                                    'eval_perplexity': eval_results['perplexity'],
+                                })
                             self.model.train()
                         
                         # Save checkpoint
@@ -351,17 +434,27 @@ class Trainer:
                         # Log progress
                         if self.global_step % self.config.training.logging_steps == 0:
                             logs = {
-                                "loss": tr_loss / self.global_step,
-                                "learning_rate": self.get_lr(),
                                 "epoch": self.epoch,
                                 "step": self.global_step,
+                                "learning_rate": self.get_lr(),
+                                "train_loss": tr_loss / self.global_step,
                             }
                             logger.info(f"Training: {logs}")
+                            self.log_metrics(logs)
                         
                         # Evaluate if needed
                         if (self.config.training.evaluation_strategy == "steps" and 
                             self.global_step % self.config.training.eval_steps == 0):
-                            self.evaluate()
+                            eval_results = self.evaluate()
+                            if eval_results:
+                                self.log_metrics({
+                                    'epoch': self.epoch,
+                                    'step': self.global_step,
+                                    'learning_rate': self.get_lr(),
+                                    'train_loss': tr_loss / self.global_step,
+                                    'eval_loss': eval_results['loss'],
+                                    'eval_perplexity': eval_results['perplexity'],
+                                })
                             self.model.train()
                         
                         # Save checkpoint
@@ -375,7 +468,16 @@ class Trainer:
             
             # Evaluate at end of epoch if configured
             if self.config.training.evaluation_strategy == "epoch":
-                self.evaluate()
+                eval_results = self.evaluate()
+                if eval_results:
+                    self.log_metrics({
+                        'epoch': self.epoch,
+                        'step': self.global_step,
+                        'learning_rate': self.get_lr(),
+                        'train_loss': tr_loss / self.global_step,
+                        'eval_loss': eval_results['loss'],
+                        'eval_perplexity': eval_results['perplexity'],
+                    })
                 self.model.train()
             
             # Break if max steps reached
@@ -385,7 +487,17 @@ class Trainer:
         # Save final model
         self.save_model()
         
-        return tr_loss / self.global_step
+        # Log final metrics
+        final_logs = {
+            'epoch': self.epoch,
+            'step': self.global_step,
+            'learning_rate': self.get_lr(),
+            'train_loss': tr_loss / self.global_step if self.global_step > 0 else 0,
+        }
+        logger.info(f"Final training metrics: {final_logs}")
+        self.log_metrics(final_logs)
+        
+        return tr_loss / self.global_step if self.global_step > 0 else 0
     
     def evaluate(self):
         """Evaluate the model on the evaluation dataset."""
@@ -479,6 +591,11 @@ class Trainer:
             },
             os.path.join(path, "optimizer.pt")
         )
+        
+        # Save training metrics
+        if self.training_metrics:
+            with open(os.path.join(path, "metrics.json"), "w") as f:
+                json.dump(self.training_metrics, f, indent=2)
         
         logger.info(f"Model saved to {path}")
         

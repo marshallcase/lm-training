@@ -5,6 +5,8 @@ import json
 import logging
 import torch
 from transformers import AutoTokenizer
+import sys
+from datetime import datetime
 
 from lmtraining.config import Config
 from lmtraining.models.transformer import TransformerModel
@@ -12,12 +14,33 @@ from lmtraining.data.dataset import create_dataloaders
 from lmtraining.training.trainer import Trainer
 
 
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    datefmt="%m/%d/%Y %H:%M:%S",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+# Set up logging to both console and file
+def setup_logging(output_dir):
+    # Create logs directory if it doesn't exist
+    logs_dir = os.path.join(output_dir, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    
+    # Create a timestamped log file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(logs_dir, f"training_{timestamp}.log")
+    
+    # Configure logging
+    handlers = [
+        logging.FileHandler(log_file),
+        logging.StreamHandler(sys.stdout)
+    ]
+    
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+        handlers=handlers
+    )
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"Logging to file: {log_file}")
+    
+    return logger
 
 
 def main():
@@ -61,12 +84,42 @@ def main():
         default=0,
         help="GPU device ID to use",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode with more logging",
+    )
     args = parser.parse_args()
+    
+    # Load configuration first to get output_dir for logging setup
+    config = Config.from_json(args.config_path)
+    
+    # Override output dir if provided
+    if args.output_dir:
+        config.training.output_dir = args.output_dir
+    
+    # Create output directory
+    os.makedirs(config.training.output_dir, exist_ok=True)
+    
+    # Setup logging to both console and file
+    logger = setup_logging(config.training.output_dir)
+    
+    # Save command line arguments
+    args_file = os.path.join(config.training.output_dir, "run_args.json")
+    with open(args_file, "w") as f:
+        json.dump(vars(args), f, indent=2)
+    logger.info(f"Command line arguments saved to {args_file}")
+    
+    # Print run information
+    logger.info("=" * 50)
+    logger.info(f"Starting training run at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Config file: {args.config_path}")
+    logger.info(f"Output directory: {config.training.output_dir}")
+    logger.info("=" * 50)
     
     # Check GPU availability if force_gpu is set
     if args.force_gpu and not torch.cuda.is_available():
         logger.error("GPU not available but --force_gpu was set. Exiting.")
-        import sys
         sys.exit(1)
     
     # Select specific GPU if multiple are available
@@ -90,19 +143,20 @@ def main():
         logger.warning("CUDA is not available. Training will run on CPU.")
     
     # Set random seed
+    logger.info(f"Setting random seed to {args.seed}")
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     
-    # Load configuration
-    config = Config.from_json(args.config_path)
-    
-    # Override output dir if provided
-    if args.output_dir:
-        config.training.output_dir = args.output_dir
-    
-    # Create output directory
-    os.makedirs(config.training.output_dir, exist_ok=True)
+    # Save expanded configuration
+    config_file = os.path.join(config.training.output_dir, "full_config.json")
+    with open(config_file, "w") as f:
+        json.dump({
+            "model": {k: getattr(config.model, k) for k in config.model.__dataclass_fields__},
+            "training": {k: getattr(config.training, k) for k in config.training.__dataclass_fields__},
+            "data": {k: getattr(config.data, k) for k in config.data.__dataclass_fields__}
+        }, f, indent=2)
+    logger.info(f"Full configuration saved to {config_file}")
     
     # Load tokenizer
     logger.info(f"Loading tokenizer: {config.data.tokenizer_name}")
@@ -127,6 +181,14 @@ def main():
         streaming=args.streaming,
         max_samples=args.max_samples
     )
+    
+    # Log dataloader information
+    if not args.streaming and not isinstance(train_dataloader.dataset, torch.utils.data.IterableDataset):
+        logger.info(f"Train dataset size: {len(train_dataloader.dataset)}")
+        logger.info(f"Train batches: {len(train_dataloader)}")
+    if eval_dataloader and not isinstance(eval_dataloader.dataset, torch.utils.data.IterableDataset):
+        logger.info(f"Eval dataset size: {len(eval_dataloader.dataset)}")
+        logger.info(f"Eval batches: {len(eval_dataloader)}")
     
     # Update vocabulary size in config if needed
     if tokenizer.vocab_size != config.model.vocab_size:
@@ -164,10 +226,27 @@ def main():
         logger.info(f"GPU memory before training: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
     
     # Train model
+    logger.info("=" * 30)
     logger.info("Starting training")
-    trainer.train()
+    logger.info("=" * 30)
+    try:
+        train_loss = trainer.train()
+        logger.info(f"Training complete. Final loss: {train_loss:.4f}")
+    except Exception as e:
+        logger.exception(f"Training failed with error: {e}")
+        raise
     
+    logger.info("=" * 30)
     logger.info("Training complete")
+    logger.info("=" * 30)
+    
+    # Print final summary
+    if torch.cuda.is_available():
+        logger.info(f"Final GPU memory usage: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+    
+    logger.info(f"Output directory: {config.training.output_dir}")
+    logger.info(f"Best model saved at: {os.path.join(config.training.output_dir, 'best_model')}")
+    logger.info(f"Training metrics saved at: {os.path.join(config.training.output_dir, 'training_metrics.csv')}")
 
 
 if __name__ == "__main__":
